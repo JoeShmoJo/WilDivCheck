@@ -20,8 +20,9 @@ outflow of Detroit and Lookout Point respectively, so they carry no storage
 adjustment of their own and are skipped. Foster is skipped as a plotted
 project, and its demand is added to Green Peter's instead.
 
-USGS downloads are cached under data/cache/ as one CSV per site, so a rerun
-is offline. Pass --refresh to force a re-download.
+USGS downloads are cached under data/cache/ as one CSV per site, and only the
+days missing from the cache are ever requested, so a rerun downloads nothing
+and a rerun the next day downloads one day. Pass --refresh to re-download.
 
 Usage
 -----
@@ -76,6 +77,7 @@ CACHE_DIR = os.path.join(DATA_DIR, "cache")
 ELEV_DICT_PATH = os.path.join(DATA_DIR, "WIL_ELEV_DICT.csv")
 STOR_RATINGS_PATH = os.path.join(DATA_DIR, "STOR_RATINGS.xlsx")
 DEMAND_PATH = os.path.join(DATA_DIR, "ALT_WithdrawalDemand.csv")
+RULE_CURVE_PATH = os.path.join(DATA_DIR, "RuleCurves.csv")
 
 # USGS now requires a personal access token for api.waterdata.usgs.gov.
 # API_USGS_PAT is the variable dataretrieval itself reads; USGS_API_KEY is
@@ -96,6 +98,7 @@ LAST_YEAR = 2026
 CFS_DAY_TO_ACRE_FT = 86400.0 / 43560.0
 
 # Validated 2-series categorical palette (dataviz reference instance).
+COLOR_RULE = "#000000"       # rule curve: a reference line, not a series
 COLOR_OBSERVED = "#2a78d6"   # categorical slot 1, blue
 COLOR_ADJUSTED = "#eb6834"   # categorical slot 2, orange
 COLOR_SURFACE = "#fcfcfb"
@@ -387,6 +390,58 @@ def demand_for_project(demand: pd.DataFrame, code: str) -> tuple[pd.Series, str]
     return demand[present].sum(axis=1), " + ".join(present)
 
 
+def read_rule_curves(projects: dict, path: str) -> dict:
+    """Rule curve elevation per project, as a (month, day) -> elevation map.
+
+    RuleCurves.csv is one column per project over many years, and the curve
+    repeats annually (the years differ by under a foot, from leap-day
+    alignment), so it is stored as a day-of-year pattern and mapped onto
+    whichever year is being plotted. The most recent year present is used as
+    the pattern. Green Peter has no column in the file and simply gets no rule
+    curve line.
+    """
+    if not os.path.exists(path):
+        print(f"[WARNING] No rule curves at {path}; plots omit the rule curve.")
+        return {}
+
+    raw = pd.read_csv(path)
+    date_col = raw.columns[0]
+    # The first row's date is a spreadsheet overflow ("#####"), so bad dates
+    # are dropped rather than trusted.
+    dates = pd.to_datetime(raw[date_col], format="%d%b%Y", errors="coerce")
+    raw = raw[dates.notna()].set_index(pd.DatetimeIndex(dates.dropna()))
+
+    curves = {}
+    for column in raw.columns:
+        if column == date_col:
+            continue
+        code = _match_project(column, projects)
+        if code is None:
+            continue
+        series = _numeric(raw[column]).dropna()
+        if series.empty:
+            continue
+        latest = series[series.index.year == series.index.year.max()]
+        pattern = latest if len(latest) >= 300 else series
+        pattern = pattern.groupby([pattern.index.month, pattern.index.day]).mean()
+        curves[code] = pattern
+        print(f"[INFO] Rule curve {code}: {pattern.min():,.2f}-{pattern.max():,.2f} ft "
+              f"from {latest.index.year.max() if len(latest) >= 300 else 'all years'}")
+
+    missing = sorted(set(projects) - set(curves))
+    if missing:
+        print(f"[INFO] No rule curve column for: {', '.join(missing)}")
+    return curves
+
+
+def rule_curve_for_year(pattern: pd.Series, year: int) -> pd.Series:
+    """Map a (month, day) rule curve pattern onto one calendar year."""
+    axis = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+    aligned = pattern.reindex(pd.MultiIndex.from_arrays([axis.month, axis.day]))
+    aligned.index = axis
+    return aligned.ffill()
+
+
 def demand_for_year(series: pd.Series, year: int) -> pd.Series:
     """Align one project's demand to a calendar year.
 
@@ -572,28 +627,76 @@ def download_elevation(site: str, start: str, end: str, label: str = "") -> pd.S
     return series
 
 
+def _missing_spans(cached: pd.Series, start: pd.Timestamp, end: pd.Timestamp):
+    """The parts of [start, end] the cache does not already cover.
+
+    Only the head and tail matter. Interior gaps are real gaps in the USGS
+    record -- days the gage did not report -- and re-requesting them every run
+    would download the whole span again to learn nothing.
+    """
+    if cached is None or cached.empty:
+        return [(start, end)]
+    spans = []
+    if start < cached.index.min():
+        spans.append((start, cached.index.min() - pd.Timedelta(days=1)))
+    if end > cached.index.max():
+        spans.append((cached.index.max() + pd.Timedelta(days=1), end))
+    return spans
+
+
 def get_elevations(sites: pd.DataFrame, start: str, end: str, refresh: bool = False):
-    """Elevation series per project, reading the cache unless --refresh."""
+    """Elevation series per project, downloading only what the cache lacks.
+
+    USGS requires an API key partly to discourage repeated identical downloads,
+    so a cached day is never requested twice: a run tops the cache up with the
+    days on either end of it and reuses everything already stored. --refresh
+    forces the whole span to be downloaded again.
+    """
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
     elevations = {}
+
     for row in sites.itertuples():
+        label = f"{row.code} ({row.name})"
         cached = None if refresh else _read_cache(row.site)
-        if cached is not None and not cached.empty:
-            print(f"[INFO] {row.code} ({row.name}): {len(cached)} cached daily values")
+        spans = [(first, last)] if refresh else _missing_spans(cached, first, last)
+
+        if cached is not None and not cached.empty and not spans:
+            covered = cached.loc[first:last]
+            print(f"[INFO] {label}: {len(covered):,} values from cache "
+                  f"({cached.index.min().date()} to {cached.index.max().date()}), "
+                  f"no download needed")
             elevations[row.code] = cached
             continue
-        try:
-            label = f"{row.code} ({row.name})"
-            series = download_elevation(row.site, start, end, label)
-        except Exception as exc:
-            print(f"[ERROR] {row.code} ({row.name}) site {row.site} download failed: {exc}")
+
+        if cached is not None and not cached.empty:
+            print(f"[INFO] {label}: cache holds {cached.index.min().date()} to "
+                  f"{cached.index.max().date()}; fetching "
+                  + ", ".join(f"{a.date()} to {b.date()}" for a, b in spans))
+
+        pieces = [] if cached is None or refresh else [cached]
+        failed = False
+        for span_start, span_end in spans:
+            try:
+                pieces.append(download_elevation(
+                    row.site, span_start.strftime("%Y-%m-%d"),
+                    span_end.strftime("%Y-%m-%d"), label))
+            except Exception as exc:
+                print(f"[ERROR] {label} site {row.site} download failed: {exc}")
+                failed = True
+                break
+
+        merged = pd.concat(pieces) if pieces else pd.Series(dtype=float)
+        if not merged.empty:
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        if merged.empty:
+            print(f"[WARNING] {label} returned no data.")
             continue
-        if series.empty:
-            print(f"[WARNING] {row.code} ({row.name}) returned no data.")
-            continue
-        _write_cache(row.site, series)
-        print(f"[INFO] {row.code} ({row.name}): downloaded {len(series)} daily values "
-              f"({series.index.min().date()} to {series.index.max().date()})")
-        elevations[row.code] = series
+
+        if not failed and (cached is None or len(merged) != len(cached)):
+            _write_cache(row.site, merged)
+            print(f"[INFO] {label}: cached {len(merged):,} daily values "
+                  f"({merged.index.min().date()} to {merged.index.max().date()})")
+        elevations[row.code] = merged
     return elevations
 
 
@@ -660,30 +763,38 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
     fig.patch.set_facecolor(COLOR_SURFACE)
     ax.set_facecolor(COLOR_SURFACE)
 
+    traces = []
+    if "elev_rule_ft" in frame.columns and frame["elev_rule_ft"].notna().any():
+        ax.plot(frame.index, frame["elev_rule_ft"], color=COLOR_RULE,
+                linewidth=1.4, label="Rule curve", zorder=2)
+        traces.append(("elev_rule_ft", COLOR_RULE, "Rule curve"))
     ax.plot(frame.index, frame["elev_observed_ft"], color=COLOR_OBSERVED,
             linewidth=2.0, label="Observed", zorder=3)
     ax.plot(frame.index, frame["elev_adjusted_ft"], color=COLOR_ADJUSTED,
             linewidth=2.0, label="Adjusted for withdrawal", zorder=4)
-    ax.fill_between(frame.index, frame["elev_adjusted_ft"], frame["elev_observed_ft"],
-                    color=COLOR_ADJUSTED, alpha=0.12, linewidth=0, zorder=2)
+    traces += [("elev_observed_ft", COLOR_OBSERVED, "Observed"),
+               ("elev_adjusted_ft", COLOR_ADJUSTED, "Adjusted")]
 
     # Direct labels at the last day both traces share, so identity is never
     # carried by color alone.
-    both = frame[["elev_observed_ft", "elev_adjusted_ft"]].dropna()
-    if not both.empty:
-        x = both.index[-1]
-        pad = pd.Timedelta(days=4)
-        y_obs = float(both["elev_observed_ft"].iloc[-1])
-        y_adj = float(both["elev_adjusted_ft"].iloc[-1])
-        # Early in a year the traces have barely separated, so the two labels
-        # would overprint. Push them apart by a fraction of the plotted range.
-        span = float(np.nanmax(both.to_numpy()) - np.nanmin(both.to_numpy())) or 1.0
-        if abs(y_obs - y_adj) < 0.06 * span:
-            offset = 0.03 * span
-            y_obs, y_adj = y_obs + offset, y_adj - offset
-        for y, color, label in ((y_obs, COLOR_OBSERVED, "Observed"),
-                                (y_adj, COLOR_ADJUSTED, "Adjusted")):
-            ax.annotate(label, xy=(x + pad, y), color=color, fontsize=9,
+    plotted = frame[[c for c, _, _ in traces]].dropna(how="all")
+    if not plotted.empty:
+        x = plotted.index[-1] + pd.Timedelta(days=4)
+        span = float(np.nanmax(plotted.to_numpy()) - np.nanmin(plotted.to_numpy())) or 1.0
+        placed = []
+        for column, color, label in traces:
+            value = plotted[column].dropna()
+            if not value.empty:
+                placed.append([float(value.iloc[-1]), color, label])
+        # Traces converge -- early in a year, or when a reservoir sits on its
+        # rule curve -- so labels are spaced apart from the bottom up.
+        placed.sort(key=lambda item: item[0])
+        gap = 0.055 * span
+        for i in range(1, len(placed)):
+            if placed[i][0] - placed[i - 1][0] < gap:
+                placed[i][0] = placed[i - 1][0] + gap
+        for y, color, label in placed:
+            ax.annotate(label, xy=(x, y), color=color, fontsize=9,
                         fontweight="bold", va="center", ha="left",
                         annotation_clip=False)
 
@@ -722,7 +833,7 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
     # Below the axes: a rule-curve pool fills the plot area at some point in
     # every year, so any in-axes corner eventually collides with the data.
     legend = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10),
-                       frameon=False, fontsize=9.5, ncol=2)
+                       frameon=False, fontsize=9.5, ncol=3)
     for text in legend.get_texts():
         text.set_color(COLOR_TEXT_MUTED)
 
@@ -810,12 +921,14 @@ def main(argv=None) -> int:
     args = parser.parse_args(_cli_args(argv))
 
     if args.data_dir:
-        global DATA_DIR, CACHE_DIR, ELEV_DICT_PATH, STOR_RATINGS_PATH, DEMAND_PATH
+        global DATA_DIR, CACHE_DIR, ELEV_DICT_PATH, STOR_RATINGS_PATH
+        global DEMAND_PATH, RULE_CURVE_PATH
         DATA_DIR = os.path.abspath(args.data_dir)
         CACHE_DIR = os.path.join(DATA_DIR, "cache")
         ELEV_DICT_PATH = os.path.join(DATA_DIR, "WIL_ELEV_DICT.csv")
         STOR_RATINGS_PATH = os.path.join(DATA_DIR, "STOR_RATINGS.xlsx")
         DEMAND_PATH = os.path.join(DATA_DIR, "ALT_WithdrawalDemand.csv")
+        RULE_CURVE_PATH = os.path.join(DATA_DIR, "RuleCurves.csv")
         print(f"[INFO] Reading inputs from {DATA_DIR}")
 
     years = args.years or list(range(FIRST_YEAR, LAST_YEAR + 1))
@@ -837,6 +950,8 @@ def main(argv=None) -> int:
     curves = read_stor_ratings(projects, STOR_RATINGS_PATH)
     print()
     demand = read_demand(projects, DEMAND_PATH)
+    print()
+    rule_curves = read_rule_curves(projects, RULE_CURVE_PATH)
     print()
 
     start = f"{min(years)}-01-01"
@@ -868,6 +983,10 @@ def main(argv=None) -> int:
             if frame.empty:
                 print(f"[WARNING] {year} {code}: no elevation record; skipped.")
                 continue
+
+            if code in rule_curves:
+                frame["elev_rule_ft"] = rule_curve_for_year(
+                    rule_curves[code], year).reindex(frame.index)
 
             png = os.path.join(year_dir, f"{code}_{year}_elevation.png")
             plot_year(frame, code, name, year, png)

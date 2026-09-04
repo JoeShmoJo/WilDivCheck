@@ -84,14 +84,25 @@ It also runs unchanged in a Jupyter notebook or a VS Code interactive window
 with no arguments -- the kernel's own command line is ignored, and `data/` is
 located whether the working directory is `src/` or the repository root.
 
-USGS downloads are cached under `data/cache/`, one CSV per site, so reruns are
-offline. Pass `--refresh` to re-download, `--years 2020 2021` to limit the run,
+USGS downloads are cached under `data/cache/`, one CSV per site. A cached day
+is never requested twice: a run downloads only the days on either end of what
+the cache already holds, so rerunning the next day fetches that one day and
+rerunning unchanged fetches nothing. Pass `--refresh` to re-download the whole
+span, `--years 2020 2021` to limit the run,
 and `--out` / `--data-dir` to redirect the output or input directories.
 
 Alongside each PNG the script writes a CSV of the same name carrying the
 observed and adjusted elevation, the observed and adjusted storage, the daily
 demand, the cumulative withdrawal, and the elevation change, so the plotted
 numbers can be checked.
+
+## Rule curve
+
+Each plot also carries the project's rule curve in black, read from
+`data/RuleCurves.csv`. The file covers 1900-2020 and the curve repeats
+annually -- the years differ by under a foot, from leap-day alignment -- so it
+is applied as a day-of-year pattern taken from the most recent year present.
+Green Peter has no column in that file and is plotted without a rule curve.
 
 ## Method
 
