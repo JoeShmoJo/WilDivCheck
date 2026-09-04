@@ -93,7 +93,8 @@ and `--out` / `--data-dir` to redirect the output or input directories.
 
 Alongside each PNG the script writes a CSV of the same name carrying the
 observed and adjusted elevation, the observed and adjusted storage, the daily
-demand, the cumulative withdrawal, and the elevation change, so the plotted
+demand, the withdrawal to date, the deficit still outstanding, and the
+elevation change, so the plotted
 numbers can be checked.
 
 ## Rule curve
@@ -111,10 +112,16 @@ the file is plotted without a rule curve.
   on the project's rating table, and back the same way. Values outside the
   tabulated range are clamped to its end points rather than extrapolated.
 - Demand in cfs becomes volume at 1 cfs-day = 86,400 ft³ = 1.9834711 acre-feet.
-- The deficit is cumulative: 01Jan carries none, so both traces start together,
-  and each later day is reduced by the running total of everything withdrawn
-  before it. The deficit therefore persists past the end of the irrigation
-  season — the water is gone.
+- The deficit accumulates while the demand is on: 01Jan carries none, so both
+  traces start together, and each later day is reduced by everything withdrawn
+  before it.
+- Once the demand stops, the deficit is repaid out of the reservoir's own
+  drawdown. Every acre-foot released after the season is an acre-foot that would
+  instead have covered the withdrawal, so the operator reaches the same target
+  pool having released that much less, and the adjusted trace holds level while
+  the observed trace falls to meet it. Where a project draws down far enough the
+  two rejoin; where it does not — Cougar and Lookout Point in several years — the
+  deficit is still open on 31 December, which is the real result.
 - Where the demand exceeds the storage available above the bottom of the rating
   curve, the adjusted trace is pinned to the curve minimum and the plot subtitle
   says on how many days that happened. On those days the adjusted elevation

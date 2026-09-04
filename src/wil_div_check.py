@@ -714,6 +714,40 @@ def get_elevations(sites: pd.DataFrame, start: str, end: str, refresh: bool = Fa
 # Adjustment
 # --------------------------------------------------------------------------
 
+def _carried_deficit(daily_af: pd.Series, storage_obs: pd.Series) -> pd.Series:
+    """The withdrawal deficit carried into each day, in acre-feet.
+
+    Withdrawal accumulates while the demand is on. Once it stops, the deficit is
+    repaid out of the reservoir's own drawdown: every acre-foot released after
+    the season is an acre-foot that would instead have covered the withdrawal,
+    so the operator reaches the same target pool having released that much less.
+
+    Carrying the full season's withdrawal to 31 December instead would subtract
+    it from a pool that has already drawn down to its winter minimum, and the
+    adjusted trace would fall off the bottom of the rating curve months after
+    the last withdrawal.
+
+    Days with no observed elevation neither accrue nor repay -- the release over
+    a gap in the record is unknown, so the deficit is simply held.
+    """
+    take = daily_af.to_numpy(dtype=float)
+    storage = storage_obs.to_numpy(dtype=float)
+    carried = np.zeros(len(take))
+
+    deficit = 0.0
+    for i in range(len(take)):
+        # Today's withdrawal is felt tomorrow, so 01Jan carries no deficit.
+        carried[i] = deficit
+        deficit += take[i]
+        if take[i] > 0.0 or deficit <= 0.0 or i + 1 >= len(take):
+            continue
+        release = storage[i] - storage[i + 1]
+        if np.isfinite(release) and release > 0.0:
+            deficit = max(0.0, deficit - release)
+
+    return pd.Series(carried, index=daily_af.index)
+
+
 def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
                 year: int) -> pd.DataFrame:
     """Deplete one year of observed elevation by the cumulative withdrawal.
@@ -722,7 +756,8 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
     curve, the withdrawal demand is accumulated in acre-feet from 01Jan, and
     the difference is converted back to an elevation. 01Jan itself carries no
     deficit - the first day's withdrawal is felt on 02Jan - so the two traces
-    start together and diverge over the year.
+    start together and diverge over the year, then converge again as the
+    reservoir draws down after the demand season (see `_carried_deficit`).
     """
     start = pd.Timestamp(year=year, month=1, day=1)
     end = pd.Timestamp(year=year, month=12, day=31)
@@ -737,18 +772,19 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
 
     demand = demand_cfs.reindex(axis).fillna(0.0).clip(lower=0.0)
     daily_af = demand * CFS_DAY_TO_ACRE_FT
-    cumulative_af = daily_af.cumsum().shift(1).fillna(0.0)
+    withdrawn_af = daily_af.cumsum().shift(1).fillna(0.0)
 
     storage_obs = pd.Series(curve.to_storage(observed.to_numpy()), index=axis)
     storage_obs[observed.isna()] = np.nan
-    storage_adj = (storage_obs - cumulative_af).clip(lower=curve.min_storage)
+    deficit_af = _carried_deficit(daily_af, storage_obs)
+    storage_adj = (storage_obs - deficit_af).clip(lower=curve.min_storage)
     elevation_adj = pd.Series(curve.to_elevation(storage_adj.to_numpy()), index=axis)
     elevation_adj[storage_adj.isna()] = np.nan
 
     # Days where the demand exceeded the storage available above the bottom of
     # the rating curve. The adjusted trace is pinned to the curve minimum there,
     # so it understates the shortfall and should not be read as a real elevation.
-    unclipped = storage_obs - cumulative_af
+    unclipped = storage_obs - deficit_af
     at_floor = unclipped < curve.min_storage
 
     return pd.DataFrame({
@@ -757,7 +793,8 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
         "storage_observed_af": storage_obs,
         "storage_adjusted_af": storage_adj,
         "demand_cfs": demand,
-        "cumulative_withdrawal_af": cumulative_af,
+        "cumulative_withdrawal_af": withdrawn_af,
+        "deficit_af": deficit_af,
         "elev_change_ft": elevation_adj - observed,
         "at_rating_floor": at_floor.fillna(False),
     })
@@ -773,40 +810,13 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
     fig.patch.set_facecolor(COLOR_SURFACE)
     ax.set_facecolor(COLOR_SURFACE)
 
-    traces = []
     if "elev_rule_ft" in frame.columns and frame["elev_rule_ft"].notna().any():
         ax.plot(frame.index, frame["elev_rule_ft"], color=COLOR_RULE,
                 linewidth=1.4, label="Rule curve", zorder=2)
-        traces.append(("elev_rule_ft", COLOR_RULE, "Rule curve"))
     ax.plot(frame.index, frame["elev_observed_ft"], color=COLOR_OBSERVED,
             linewidth=2.0, label="Observed", zorder=3)
     ax.plot(frame.index, frame["elev_adjusted_ft"], color=COLOR_ADJUSTED,
             linewidth=2.0, label="Adjusted for withdrawal", zorder=4)
-    traces += [("elev_observed_ft", COLOR_OBSERVED, "Observed"),
-               ("elev_adjusted_ft", COLOR_ADJUSTED, "Adjusted")]
-
-    # Direct labels at the last day both traces share, so identity is never
-    # carried by color alone.
-    plotted = frame[[c for c, _, _ in traces]].dropna(how="all")
-    if not plotted.empty:
-        x = plotted.index[-1] + pd.Timedelta(days=4)
-        span = float(np.nanmax(plotted.to_numpy()) - np.nanmin(plotted.to_numpy())) or 1.0
-        placed = []
-        for column, color, label in traces:
-            value = plotted[column].dropna()
-            if not value.empty:
-                placed.append([float(value.iloc[-1]), color, label])
-        # Traces converge -- early in a year, or when a reservoir sits on its
-        # rule curve -- so labels are spaced apart from the bottom up.
-        placed.sort(key=lambda item: item[0])
-        gap = 0.055 * span
-        for i in range(1, len(placed)):
-            if placed[i][0] - placed[i - 1][0] < gap:
-                placed[i][0] = placed[i - 1][0] + gap
-        for y, color, label in placed:
-            ax.annotate(label, xy=(x, y), color=color, fontsize=9,
-                        fontweight="bold", va="center", ha="left",
-                        annotation_clip=False)
 
     drop = frame["elev_change_ft"].dropna()
     if not drop.empty:
@@ -836,12 +846,12 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
         ax.spines[side].set_color(COLOR_GRID)
     ax.tick_params(colors=COLOR_TEXT_MUTED, labelsize=9)
 
-    ax.set_xlim(frame.index[0], frame.index[-1] + pd.Timedelta(days=26))
+    ax.set_xlim(frame.index[0], frame.index[-1])
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
 
-    # Below the axes: a rule-curve pool fills the plot area at some point in
-    # every year, so any in-axes corner eventually collides with the data.
+    # Below the axes: the traces fill the plot area at some point in every
+    # year, so any in-axes corner eventually collides with the data.
     legend = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10),
                        frameon=False, fontsize=9.5, ncol=3)
     for text in legend.get_texts():
