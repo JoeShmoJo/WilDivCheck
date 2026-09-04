@@ -28,6 +28,9 @@ Usage
     python wil_div_check.py                  # download (or use cache) and plot
     python wil_div_check.py --refresh        # force re-download from USGS
     python wil_div_check.py --years 2020 2021
+
+It also runs as-is in a Jupyter/VS Code interactive window or notebook with
+no arguments; the kernel's own command line is ignored.
 """
 
 from __future__ import annotations
@@ -48,9 +51,26 @@ import pandas as pd
 # Configuration
 # --------------------------------------------------------------------------
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.normpath(os.path.join(HERE, "..", "data"))
-OUT_DIR = os.path.normpath(os.path.join(HERE, "..", "out"))
+try:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    # Pasted into a notebook cell, so there is no __file__ to anchor to.
+    HERE = os.path.abspath(os.getcwd())
+
+
+def _find_data_dir():
+    """Locate data/ whether we are run from src/, the repo root, or a notebook."""
+    for base in (HERE, os.path.join(HERE, ".."), os.getcwd(),
+                 os.path.join(os.getcwd(), "..")):
+        candidate = os.path.normpath(os.path.join(base, "data"))
+        if os.path.exists(os.path.join(candidate, "WIL_ELEV_DICT.csv")):
+            return candidate
+    return os.path.normpath(os.path.join(HERE, "..", "data"))
+
+
+DATA_DIR = _find_data_dir()
+REPO_DIR = os.path.dirname(DATA_DIR)
+OUT_DIR = os.path.join(REPO_DIR, "out")
 CACHE_DIR = os.path.join(DATA_DIR, "cache")
 
 ELEV_DICT_PATH = os.path.join(DATA_DIR, "WIL_ELEV_DICT.csv")
@@ -598,6 +618,27 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
 # Main
 # --------------------------------------------------------------------------
 
+def _cli_args(argv):
+    """Command-line arguments, minus anything a notebook kernel injected.
+
+    Jupyter launches as `ipykernel_launcher.py --f=...kernel.json`, which
+    argparse rejects. Under a kernel, keep only the flags this script defines.
+    """
+    if argv is not None:
+        return list(argv)
+    args = list(sys.argv[1:])
+    if "ipykernel" not in sys.modules:
+        return args
+    known = ("--refresh", "--years", "--out", "--data-dir")
+    cleaned, keep = [], False
+    for arg in args:
+        if arg.startswith("-"):
+            keep = arg.split("=")[0] in known
+        if keep:
+            cleaned.append(arg)
+    return cleaned
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -609,7 +650,7 @@ def main(argv=None) -> int:
     parser.add_argument("--data-dir", default=None,
                         help="read inputs from here instead of ../data (for testing "
                              "against generated inputs, see make_dummy_inputs.py)")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_cli_args(argv))
 
     if args.data_dir:
         global DATA_DIR, CACHE_DIR, ELEV_DICT_PATH, STOR_RATINGS_PATH, DEMAND_PATH
@@ -680,4 +721,7 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    status = main()
+    # SystemExit inside a notebook surfaces as an ugly traceback; just return.
+    if "ipykernel" not in sys.modules:
+        sys.exit(status)

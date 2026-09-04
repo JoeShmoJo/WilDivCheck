@@ -50,6 +50,10 @@ cd src
 python wil_div_check.py
 ```
 
+It also runs unchanged in a Jupyter notebook or a VS Code interactive window
+with no arguments -- the kernel's own command line is ignored, and `data/` is
+located whether the working directory is `src/` or the repository root.
+
 USGS downloads are cached under `data/cache/`, one CSV per site, so reruns are
 offline. Pass `--refresh` to re-download, `--years 2020 2021` to limit the run,
 and `--out` / `--data-dir` to redirect the output or input directories.
