@@ -50,6 +50,36 @@ cd src
 python wil_div_check.py
 ```
 
+### USGS API key
+
+`api.waterdata.usgs.gov` now requires a personal access token; register at
+<https://api.waterdata.usgs.gov/signup/>. The script looks for it in this
+order, and never stores it itself:
+
+1. the `API_USGS_PAT` environment variable (what `dataretrieval` reads),
+2. `USGS_API_KEY`, accepted as an alias,
+3. `data/usgs_api_key.txt`, a one-line file that `.gitignore` excludes.
+
+The file is usually easiest under Jupyter, where the environment is awkward to
+set:
+
+```
+# from the repository root, once
+echo YOUR-KEY-HERE > data/usgs_api_key.txt
+```
+
+Treat the key as a password: do not commit it, and re-issue it at the signup
+page if it is ever exposed.
+
+### If a download returns no data
+
+Run `python wil_div_check.py --probe`. It lists the time series USGS actually
+publishes for each site, so the parameter code and statistic can be compared
+against what the script requests. Elevation is not always available as a daily
+statistic, so the downloader tries the daily endpoint first and falls back to
+averaging the continuous (instantaneous) record -- the path used for each site
+is printed.
+
 It also runs unchanged in a Jupyter notebook or a VS Code interactive window
 with no arguments -- the kernel's own command line is ignored, and `data/` is
 located whether the working directory is `src/` or the repository root.

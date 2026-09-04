@@ -77,6 +77,15 @@ ELEV_DICT_PATH = os.path.join(DATA_DIR, "WIL_ELEV_DICT.csv")
 STOR_RATINGS_PATH = os.path.join(DATA_DIR, "STOR_RATINGS.xlsx")
 DEMAND_PATH = os.path.join(DATA_DIR, "ALT_WithdrawalDemand.csv")
 
+# USGS now requires a personal access token for api.waterdata.usgs.gov.
+# API_USGS_PAT is the variable dataretrieval itself reads; USGS_API_KEY is
+# accepted as a friendlier alias. The key is a credential: it is never stored
+# in this repository, and the key file below is in .gitignore.
+API_KEY_ENV = "API_USGS_PAT"
+API_KEY_ALIAS = "USGS_API_KEY"
+API_KEY_FILENAME = "usgs_api_key.txt"
+API_KEY_SIGNUP = "https://api.waterdata.usgs.gov/signup/"
+
 ELEV_PARAMETER_CD = "62614"   # Lake or reservoir water surface elevation, NGVD29 ft
 DAILY_MEAN_STAT_CD = "00003"
 
@@ -423,37 +432,144 @@ def _write_cache(site: str, series: pd.Series) -> None:
     series.rename("elevation_ft").rename_axis("date").to_frame().to_csv(_cache_path(site))
 
 
-def download_elevation(site: str, start: str, end: str) -> pd.Series:
+def configure_api_key() -> str | None:
+    """Make the USGS API key available to dataretrieval.
+
+    Looked up in order: the API_USGS_PAT environment variable, the USGS_API_KEY
+    alias, then a one-line file named usgs_api_key.txt in the data directory.
+    Keeping the key in the environment or in that ignored file is what stops a
+    credential from being committed; nothing here writes it back to disk.
+    """
+    key = os.environ.get(API_KEY_ENV)
+    source = API_KEY_ENV
+    if not key:
+        key, source = os.environ.get(API_KEY_ALIAS), API_KEY_ALIAS
+    if not key:
+        path = os.path.join(DATA_DIR, API_KEY_FILENAME)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                key = handle.read().strip()
+            source = path
+
+    if not key:
+        print(f"[WARNING] No USGS API key found. Downloads will be rate limited "
+              f"or rejected.\n"
+              f"          Set {API_KEY_ENV}, or save the key as "
+              f"{os.path.join(DATA_DIR, API_KEY_FILENAME)}.\n"
+              f"          Register at {API_KEY_SIGNUP}")
+        return None
+
+    os.environ[API_KEY_ENV] = key
+    print(f"[INFO] USGS API key loaded from {source} (ends {key[-4:]})")
+    return key
+
+
+def _clean_series(frame: pd.DataFrame) -> pd.Series:
+    """Turn a waterdata response frame into a clean float Series on time."""
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="date"))
+
+    value_col = "value" if "value" in frame.columns else frame.columns[-1]
+    time_col = "time" if "time" in frame.columns else frame.columns[0]
+    stamps = pd.to_datetime(frame[time_col], errors="coerce", utc=True)
+    series = pd.Series(_numeric(frame[value_col]).to_numpy(),
+                       index=pd.DatetimeIndex(stamps.dt.tz_localize(None)))
+    series = series[series.index.notna()].sort_index()
+    # USGS missing-value standins used by the DP download script.
+    series[series < -9000] = np.nan
+    series[series.isin([-901, -902])] = np.nan
+    return series.dropna()
+
+
+def _daily_values(site: str, start: str, end: str, statistic: bool) -> pd.DataFrame:
+    """One call to the daily-values endpoint.
+
+    The daily endpoint's `time` field is the date an observation represents, so
+    it is queried with plain dates rather than the timestamps the continuous
+    endpoint wants.
+    """
+    from dataretrieval import waterdata
+
+    kwargs = dict(monitoring_location_id=f"USGS-{site}",
+                  parameter_code=ELEV_PARAMETER_CD,
+                  time=f"{start}/{end}",
+                  skip_geometry=True)
+    if statistic:
+        kwargs["statistic_id"] = DAILY_MEAN_STAT_CD
+    frame, _ = waterdata.get_daily(**kwargs)
+    if frame is not None and not frame.empty and not statistic:
+        # Without the filter the response can carry min/max alongside the mean.
+        if "statistic_id" in frame.columns:
+            mean_only = frame[frame["statistic_id"].astype(str).str.contains("00003")]
+            if not mean_only.empty:
+                frame = mean_only
+    return frame
+
+
+def _continuous_daily_mean(site: str, start: str, end: str, label: str) -> pd.Series:
+    """Continuous (instantaneous) record, averaged to a daily mean.
+
+    This is the path the DP download script uses for elevation. The continuous
+    endpoint accepts at most three years per call, so the record is walked one
+    calendar year at a time and each chunk is collapsed to daily means before
+    the next is fetched, which keeps 15-minute data for a decade manageable.
+    """
+    from dataretrieval import waterdata
+
+    first, last = pd.Timestamp(start), pd.Timestamp(end)
+    chunks = []
+    for year in range(first.year, last.year + 1):
+        lo = max(first, pd.Timestamp(f"{year}-01-01"))
+        hi = min(last, pd.Timestamp(f"{year}-12-31"))
+        frame, _ = waterdata.get_continuous(
+            monitoring_location_id=f"USGS-{site}",
+            parameter_code=ELEV_PARAMETER_CD,
+            time=(f"{lo.strftime('%Y-%m-%d')}T00:00:00Z/"
+                  f"{hi.strftime('%Y-%m-%d')}T23:59:59Z"),
+        )
+        chunk = _clean_series(frame)
+        if not chunk.empty:
+            chunks.append(chunk.resample("D").mean().dropna())
+        print(f"[INFO]   {label} {year}: {len(chunk):,} continuous values")
+
+    if not chunks:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="date"))
+    return pd.concat(chunks).sort_index()
+
+
+def download_elevation(site: str, start: str, end: str, label: str = "") -> pd.Series:
     """Daily mean forebay elevation for one USGS site, as a float Series.
 
     Uses the modernized USGS Water Data API (dataretrieval.waterdata), which
     replaces the legacy WaterServices endpoints that USGS is retiring. Site
     numbers are passed in the "USGS-#######" monitoring_location_id form.
+
+    Reservoir elevation is not always published as a daily statistic, so this
+    tries the cheap daily endpoint first and falls back to averaging the
+    continuous record, which is what the DP download script reads. The path
+    that produced the data is printed so a silent empty result is impossible.
     """
-    from dataretrieval import waterdata  # imported lazily so --offline needs no network stack
-
-    time_range = (f"{pd.to_datetime(start).strftime('%Y-%m-%dT00:00:00Z')}/"
-                  f"{pd.to_datetime(end).strftime('%Y-%m-%dT23:59:59Z')}")
-    data, _ = waterdata.get_daily(
-        monitoring_location_id=f"USGS-{site}",
-        parameter_code=ELEV_PARAMETER_CD,
-        statistic_id=DAILY_MEAN_STAT_CD,
-        time=time_range,
-        skip_geometry=True,
+    attempts = (
+        ("daily mean", lambda: _clean_series(_daily_values(site, start, end, True))),
+        ("daily, any statistic",
+         lambda: _clean_series(_daily_values(site, start, end, False))),
     )
-    if data is None or data.empty:
-        return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="date"))
+    for how, call in attempts:
+        try:
+            series = call()
+        except Exception as exc:
+            print(f"[INFO]   {label} {how}: failed ({exc})")
+            continue
+        if not series.empty:
+            print(f"[INFO]   {label} via {how} endpoint")
+            return series
+        print(f"[INFO]   {label} {how}: empty, trying next")
 
-    value_col = "value" if "value" in data.columns else data.columns[-1]
-    time_col = "time" if "time" in data.columns else data.columns[0]
-    series = pd.Series(
-        _numeric(data[value_col]).to_numpy(),
-        index=pd.DatetimeIndex(pd.to_datetime(data[time_col]).dt.tz_localize(None)),
-    ).sort_index()
-    # USGS missing-value standins used by the DP download script.
-    series[series < -9000] = np.nan
-    series[series.isin([-901, -902])] = np.nan
-    return series.dropna()
+    print(f"[INFO]   {label} falling back to the continuous record")
+    series = _continuous_daily_mean(site, start, end, label)
+    if not series.empty:
+        print(f"[INFO]   {label} via continuous endpoint, averaged to daily")
+    return series
 
 
 def get_elevations(sites: pd.DataFrame, start: str, end: str, refresh: bool = False):
@@ -466,7 +582,8 @@ def get_elevations(sites: pd.DataFrame, start: str, end: str, refresh: bool = Fa
             elevations[row.code] = cached
             continue
         try:
-            series = download_elevation(row.site, start, end)
+            label = f"{row.code} ({row.name})"
+            series = download_elevation(row.site, start, end, label)
         except Exception as exc:
             print(f"[ERROR] {row.code} ({row.name}) site {row.site} download failed: {exc}")
             continue
@@ -618,6 +735,43 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
 # Main
 # --------------------------------------------------------------------------
 
+def probe_sites(sites: pd.DataFrame) -> int:
+    """Report what USGS actually publishes for each site.
+
+    Run this when a download comes back empty: it lists the time series each
+    monitoring location offers, so the parameter code and statistic in use can
+    be checked against what the script asks for.
+    """
+    from dataretrieval import waterdata
+
+    for row in sites.itertuples():
+        print(f"\n=== {row.code} ({row.name})  USGS-{row.site} ===")
+        try:
+            meta, _ = waterdata.get_time_series_metadata(
+                monitoring_location_id=f"USGS-{row.site}")
+        except Exception as exc:
+            print(f"  metadata request failed: {exc}")
+            continue
+        if meta is None or meta.empty:
+            print("  no time series metadata returned")
+            continue
+        keep = [c for c in ("parameter_code", "parameter_name", "statistic_id",
+                            "computation_period_identifier", "begin", "end",
+                            "unit_of_measure")
+                if c in meta.columns]
+        table = meta[keep] if keep else meta
+        if "parameter_code" in table.columns:
+            elev = table[table["parameter_code"].astype(str) == ELEV_PARAMETER_CD]
+            if not elev.empty:
+                print(f"  parameter {ELEV_PARAMETER_CD} series:")
+                print(elev.to_string(index=False, max_colwidth=32))
+                continue
+            print(f"  no parameter {ELEV_PARAMETER_CD}; available parameters:")
+            print("   ", ", ".join(sorted(table["parameter_code"].astype(str).unique())))
+        print(table.head(25).to_string(index=False, max_colwidth=32))
+    return 0
+
+
 def _cli_args(argv):
     """Command-line arguments, minus anything a notebook kernel injected.
 
@@ -629,7 +783,7 @@ def _cli_args(argv):
     args = list(sys.argv[1:])
     if "ipykernel" not in sys.modules:
         return args
-    known = ("--refresh", "--years", "--out", "--data-dir")
+    known = ("--refresh", "--years", "--out", "--data-dir", "--probe")
     cleaned, keep = [], False
     for arg in args:
         if arg.startswith("-"):
@@ -647,6 +801,9 @@ def main(argv=None) -> int:
     parser.add_argument("--years", type=int, nargs="+",
                         help=f"years to process (default {FIRST_YEAR}-{LAST_YEAR})")
     parser.add_argument("--out", default=OUT_DIR, help="output directory (default ../out)")
+    parser.add_argument("--probe", action="store_true",
+                        help="list the time series USGS publishes for each site "
+                             "and exit; use this when a download returns no data")
     parser.add_argument("--data-dir", default=None,
                         help="read inputs from here instead of ../data (for testing "
                              "against generated inputs, see make_dummy_inputs.py)")
@@ -668,9 +825,14 @@ def main(argv=None) -> int:
             print(f"[ERROR] Missing required input: {path}")
             return 1
 
+    configure_api_key()
+
     sites = read_elev_dict(ELEV_DICT_PATH)
     projects = dict(zip(sites["code"], sites["name"]))
     print(f"[INFO] {len(projects)} projects: {', '.join(sorted(projects))}\n")
+
+    if args.probe:
+        return probe_sites(sites)
 
     curves = read_stor_ratings(projects, STOR_RATINGS_PATH)
     print()
