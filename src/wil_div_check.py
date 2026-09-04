@@ -1,0 +1,683 @@
+# -*- coding: utf-8 -*-
+"""
+WilDivCheck - Willamette reservoir elevation adjustment for withdrawal demand.
+
+For each year 2015-2026 and each Willamette Valley project, this script:
+  1. Downloads the daily mean forebay elevation from USGS (parameter 62614)
+     for the sites listed in data/WIL_ELEV_DICT.csv.
+  2. Converts the observed elevation to storage with that reservoir's
+     storage-elevation curve from data/STOR_RATINGS.xlsx.
+  3. Subtracts the running total of the withdrawal demand in
+     data/ALT_WithdrawalDemand.csv, accumulated from 01Jan of that year.
+  4. Converts the adjusted storage back to an elevation and plots the
+     observed and adjusted elevation together, one PNG per reservoir per
+     year, under out/<year>/.
+
+Excluded projects
+-----------------
+Big Cliff and Dexter are re-regulating pools that pass the daily average
+outflow of Detroit and Lookout Point respectively, so they carry no storage
+adjustment of their own and are skipped. Foster is skipped as a plotted
+project, and its demand is added to Green Peter's instead.
+
+USGS downloads are cached under data/cache/ as one CSV per site, so a rerun
+is offline. Pass --refresh to force a re-download.
+
+Usage
+-----
+    python wil_div_check.py                  # download (or use cache) and plot
+    python wil_div_check.py --refresh        # force re-download from USGS
+    python wil_div_check.py --years 2020 2021
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.normpath(os.path.join(HERE, "..", "data"))
+OUT_DIR = os.path.normpath(os.path.join(HERE, "..", "out"))
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+
+ELEV_DICT_PATH = os.path.join(DATA_DIR, "WIL_ELEV_DICT.csv")
+STOR_RATINGS_PATH = os.path.join(DATA_DIR, "STOR_RATINGS.xlsx")
+DEMAND_PATH = os.path.join(DATA_DIR, "ALT_WithdrawalDemand.csv")
+
+ELEV_PARAMETER_CD = "62614"   # Lake or reservoir water surface elevation, NGVD29 ft
+DAILY_MEAN_STAT_CD = "00003"
+
+FIRST_YEAR = 2015
+LAST_YEAR = 2026
+
+# 1 cfs sustained for one day = 86400 cubic feet = 86400/43560 acre-feet.
+CFS_DAY_TO_ACRE_FT = 86400.0 / 43560.0
+
+# Validated 2-series categorical palette (dataviz reference instance).
+COLOR_OBSERVED = "#2a78d6"   # categorical slot 1, blue
+COLOR_ADJUSTED = "#eb6834"   # categorical slot 2, orange
+COLOR_SURFACE = "#fcfcfb"
+COLOR_TEXT = "#0b0b0b"
+COLOR_TEXT_MUTED = "#52514e"
+COLOR_GRID = "#e3e2df"
+
+# USGS site number -> (project code, display name). The project code is the
+# NWD 3-letter identifier used in ALT_WithdrawalDemand.csv and, normally, as
+# the STOR_RATINGS.xlsx sheet name.
+SITE_META = {
+    "14181400": ("BCL", "Big Cliff"),
+    "14162100": ("BLU", "Blue River"),
+    "14153000": ("COT", "Cottage Grove"),
+    "14159400": ("CGR", "Cougar"),
+    "14180500": ("DET", "Detroit"),
+    "14149500": ("DEX", "Dexter"),
+    "14155000": ("DOR", "Dorena"),
+    "14150900": ("FAL", "Fall Creek"),
+    "14168000": ("FRN", "Fern Ridge"),
+    "14186600": ("FOS", "Foster"),
+    "14186100": ("GPR", "Green Peter"),
+    "14145100": ("HCR", "Hills Creek"),
+    "14149000": ("LOP", "Lookout Point"),
+}
+
+# Re-regulating pools that pass the upstream project's daily average flow, and
+# Foster, whose demand is rolled into Green Peter instead of being plotted.
+SKIP_PROJECTS = {"BCL", "DEX", "FOS"}
+
+# Foster is not modelled as its own pool; its demand is taken on by Green Peter.
+# ALT_WithdrawalDemand.csv supplies a pre-combined GPR_FOS column, which is used
+# when present; otherwise GPR and FOS are summed to the same effect.
+PREFERRED_DEMAND_COLUMN = {"GPR": "GPR_FOS"}
+EXTRA_DEMAND = {"GPR": ["FOS"]}
+
+# Alternate spellings that may appear as a demand column or a rating sheet name.
+NAME_ALIASES = {
+    "BCL": ["BIGCLIFF", "BIGCLIFFLAKE"],
+    "BLU": ["BLUERIVER", "BLUERIVERLAKE"],
+    "COT": ["COTTAGEGROVE", "COTTAGEGROVELAKE", "CGL"],
+    "CGR": ["COUGAR", "COUGARLAKE"],
+    "DET": ["DETROIT", "DETROITLAKE"],
+    "DEX": ["DEXTER", "DEXTERLAKE"],
+    "DOR": ["DORENA", "DORENALAKE"],
+    "FAL": ["FALLCREEK", "FALLCREEKLAKE", "FCR"],
+    "FRN": ["FERNRIDGE", "FERNRIDGELAKE", "FRD", "FER"],
+    "FOS": ["FOSTER", "FOSTERLAKE"],
+    "GPR": ["GREENPETER", "GREENPETERLAKE", "GPE"],
+    "HCR": ["HILLSCREEK", "HILLSCREEKLAKE", "HCK"],
+    "LOP": ["LOOKOUTPOINT", "LOOKOUTPOINTLAKE", "LOK"],
+}
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+def _norm(text) -> str:
+    """Uppercase and strip everything that is not a letter or digit."""
+    return re.sub(r"[^A-Z0-9]", "", str(text).upper())
+
+
+def _match_project(label, projects) -> str | None:
+    """Resolve a sheet name or column header to one of `projects`.
+
+    Matches the 3-letter code first, then the display name, then any known
+    alias, comparing on the punctuation- and case-stripped form so that
+    "Green Peter", "GREEN_PETER" and "GPR" all land on GPR.
+    """
+    key = _norm(label)
+    if not key:
+        return None
+    for code, name in projects.items():
+        if key == code:
+            return code
+    candidates = []
+    for code, name in projects.items():
+        for alt in [code, _norm(name)] + [_norm(a) for a in NAME_ALIASES.get(code, [])]:
+            if alt:
+                candidates.append((alt, code))
+    # Longest candidate first so COTTAGEGROVE beats a stray short substring.
+    for alt, code in sorted(candidates, key=lambda p: -len(p[0])):
+        if key == alt or key.startswith(alt) or alt in key:
+            return code
+    return None
+
+
+def _numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+# --------------------------------------------------------------------------
+# Inputs
+# --------------------------------------------------------------------------
+
+def read_elev_dict(path: str = ELEV_DICT_PATH) -> pd.DataFrame:
+    """Read WIL_ELEV_DICT.csv and attach the project code and display name.
+
+    Rows whose site number is not in SITE_META, and the re-regulating pools
+    and Foster in SKIP_PROJECTS, are dropped.
+    """
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df["site"] = df["Download_Key"].astype(str).str.strip()
+    meta = df["site"].map(SITE_META)
+    unknown = df.loc[meta.isna(), "site"].tolist()
+    if unknown:
+        print(f"[WARNING] Site(s) not in SITE_META, skipped: {', '.join(unknown)}")
+    df = df.loc[meta.notna()].copy()
+    df["code"] = [m[0] for m in meta.dropna()]
+    df["name"] = [m[1] for m in meta.dropna()]
+    skipped = sorted(set(df.loc[df["code"].isin(SKIP_PROJECTS), "code"]))
+    if skipped:
+        print(f"[INFO] Skipping pass-through / rolled-up projects: {', '.join(skipped)}")
+    df = df.loc[~df["code"].isin(SKIP_PROJECTS)].copy()
+    return df.sort_values("name").reset_index(drop=True)
+
+
+def _locate_rating_columns(raw: pd.DataFrame):
+    """Find the (elevation, storage) columns in one rating sheet.
+
+    The sheet is read with header=None so a title block above the real header
+    does not confuse things. Returns two float Series with NaN rows dropped.
+    """
+    # Find the header row: the first row where one cell names elevation and a
+    # *different* cell names storage. Requiring two distinct cells keeps a title
+    # like "Blue River storage-elevation curve" from matching both on itself.
+    header_row = elev_idx = stor_idx = None
+    for i in range(min(20, len(raw))):
+        cells = [_norm(c) for c in raw.iloc[i].tolist()]
+        elev_at = [j for j, c in enumerate(cells) if "ELEV" in c]
+        stor_at = [j for j, c in enumerate(cells)
+                   if "STOR" in c or c.startswith("AF") or "ACREFT" in c]
+        pair = next(((a, b) for a in elev_at for b in stor_at if a != b), None)
+        if pair is not None:
+            header_row, (elev_idx, stor_idx) = i, pair
+            break
+
+    if header_row is not None:
+        body = raw.iloc[header_row + 1:].reset_index(drop=True)
+    else:
+        # No recognizable header - fall back to the two numeric columns, taking
+        # the one with the smaller magnitude as elevation (feet are hundreds to
+        # low thousands; storage in acre-feet is far larger).
+        body = raw
+
+    if elev_idx is None or stor_idx is None:
+        numeric_cols = []
+        for j in range(body.shape[1]):
+            col = _numeric(body.iloc[:, j])
+            if col.notna().sum() >= 3:
+                numeric_cols.append((j, col.abs().max()))
+        if len(numeric_cols) < 2:
+            raise ValueError("could not find two numeric columns for the rating curve")
+        numeric_cols.sort(key=lambda p: p[1])
+        elev_idx, stor_idx = numeric_cols[0][0], numeric_cols[-1][0]
+
+    if elev_idx == stor_idx:
+        raise ValueError("elevation and storage resolved to the same column")
+
+    elev = _numeric(body.iloc[:, elev_idx])
+    stor = _numeric(body.iloc[:, stor_idx])
+    keep = elev.notna() & stor.notna()
+    if keep.sum() < 2:
+        raise ValueError("rating curve has fewer than two usable rows")
+    elev, stor = elev[keep].to_numpy(float), stor[keep].to_numpy(float)
+
+    # A reservoir's storage in acre-feet spans a far wider range than its
+    # elevation in feet. If it does not, the columns are almost certainly
+    # mismatched, and silently producing nonsense drawdowns is worse than
+    # stopping here.
+    if np.ptp(stor) <= np.ptp(elev):
+        raise ValueError(
+            f"storage range ({np.ptp(stor):,.0f}) is not wider than the elevation "
+            f"range ({np.ptp(elev):,.0f}); columns look mismatched")
+    return elev, stor
+
+
+class RatingCurve:
+    """A monotonic storage-elevation curve with interpolation both ways.
+
+    Values outside the tabulated range are clamped to the end points rather
+    than extrapolated, so a pool drawn below the bottom of the curve reports
+    the curve's minimum elevation instead of an invented one.
+    """
+
+    def __init__(self, elevation: np.ndarray, storage: np.ndarray, label: str = ""):
+        order = np.argsort(elevation)
+        elevation, storage = elevation[order], storage[order]
+        # Drop duplicate elevations, which would make the inverse ambiguous.
+        keep = np.concatenate([[True], np.diff(elevation) > 0])
+        self.elevation, self.storage = elevation[keep], storage[keep]
+        self.label = label
+        if np.any(np.diff(self.storage) <= 0):
+            print(f"[WARNING] {label}: storage is not strictly increasing with "
+                  f"elevation; inverse lookup may be imprecise.")
+
+    @property
+    def min_storage(self) -> float:
+        return float(self.storage[0])
+
+    def to_storage(self, elev):
+        return np.interp(np.asarray(elev, dtype=float), self.elevation, self.storage)
+
+    def to_elevation(self, stor):
+        return np.interp(np.asarray(stor, dtype=float), self.storage, self.elevation)
+
+
+def read_stor_ratings(projects, path: str = STOR_RATINGS_PATH):
+    """Read STOR_RATINGS.xlsx, one sheet per reservoir, into RatingCurves."""
+    book = pd.read_excel(path, sheet_name=None, header=None)
+    curves = {}
+    for sheet_name, raw in book.items():
+        code = _match_project(sheet_name, projects)
+        if code is None:
+            print(f"[INFO] Rating sheet '{sheet_name}' does not match a project; ignored.")
+            continue
+        if code in curves:
+            print(f"[WARNING] More than one sheet matches {code}; keeping the first.")
+            continue
+        try:
+            elev, stor = _locate_rating_columns(raw)
+        except ValueError as exc:
+            print(f"[WARNING] Rating sheet '{sheet_name}' ({code}) unusable: {exc}")
+            continue
+        curves[code] = RatingCurve(elev, stor, label=code)
+        print(f"[INFO] Rating curve {code}: {len(curves[code].elevation)} points, "
+              f"elev {curves[code].elevation[0]:.1f}-{curves[code].elevation[-1]:.1f} ft, "
+              f"storage {curves[code].storage[0]:,.0f}-{curves[code].storage[-1]:,.0f} af")
+    missing = sorted(set(projects) - set(curves))
+    if missing:
+        print(f"[WARNING] No rating sheet found for: {', '.join(missing)}")
+    return curves
+
+
+def read_demand(projects, path: str = DEMAND_PATH) -> pd.DataFrame:
+    """Read ALT_WithdrawalDemand.csv into a daily flow table in cfs.
+
+    The first column that parses as dates becomes the index; every remaining
+    column is kept under its own header, normalized. Columns are matched to
+    projects later, in demand_for_project, so that a combined column such as
+    GPR_FOS stays distinct from the plain GPR column instead of being folded
+    into it and counted twice.
+    """
+    df = pd.read_csv(path)
+    date_col = None
+    for col in df.columns:
+        parsed = pd.to_datetime(df[col], errors="coerce")
+        if parsed.notna().sum() >= max(1, int(0.8 * len(df))):
+            date_col = col
+            break
+    if date_col is None:
+        raise ValueError(f"no date column found in {path}")
+
+    demand = df.drop(columns=[date_col]).apply(_numeric)
+    demand.columns = [_norm(c) for c in demand.columns]
+    demand.index = pd.to_datetime(df[date_col], errors="coerce")
+    demand = demand.loc[demand.index.notna()].sort_index()
+    demand = demand.resample("D").mean()
+
+    print(f"[INFO] Demand columns: {', '.join(demand.columns)}")
+    print(f"[INFO] Demand period: {demand.index.min().date()} to "
+          f"{demand.index.max().date()} ({len(demand):,} days)")
+    return demand
+
+
+def demand_for_project(demand: pd.DataFrame, code: str) -> tuple[pd.Series, str] | None:
+    """The demand column(s) for one project, plus a label describing the source.
+
+    Green Peter prefers the pre-combined GPR_FOS column; if the file does not
+    carry one, GPR and FOS are summed instead.
+    """
+    preferred = _norm(PREFERRED_DEMAND_COLUMN.get(code, ""))
+    if preferred and preferred in demand.columns:
+        return demand[preferred], preferred
+
+    wanted = [code] + EXTRA_DEMAND.get(code, [])
+    present = [c for c in wanted if c in demand.columns]
+    if not present:
+        # Fall back to fuzzy matching for a file that spells projects out.
+        resolved = {}
+        for column in demand.columns:
+            matched = _match_project(column, {c: c for c in wanted})
+            if matched and matched not in resolved:
+                resolved[matched] = column
+        present = list(resolved.values())
+        if not present:
+            return None
+    return demand[present].sum(axis=1), " + ".join(present)
+
+
+def demand_for_year(series: pd.Series, year: int) -> pd.Series:
+    """Align one project's demand to a calendar year.
+
+    ALT_WithdrawalDemand.csv holds a single representative year, so it is
+    treated as a seasonal pattern and applied to every year by month and day.
+    If a file spanning several calendar years is supplied instead, that year's
+    values are used directly.
+    """
+    axis = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+    if series.index.year.nunique() > 1:
+        return series.reindex(axis)
+
+    pattern = series.copy()
+    pattern.index = pd.MultiIndex.from_arrays(
+        [pattern.index.month, pattern.index.day], names=["month", "day"])
+    pattern = pattern[~pattern.index.duplicated()]
+    aligned = pattern.reindex(pd.MultiIndex.from_arrays([axis.month, axis.day]))
+    aligned.index = axis
+    # A leap-day gap (pattern year not a leap year, target year is) carries the
+    # previous day forward rather than dropping to zero.
+    return aligned.ffill()
+
+
+# --------------------------------------------------------------------------
+# USGS download
+# --------------------------------------------------------------------------
+
+def _cache_path(site: str) -> str:
+    return os.path.join(CACHE_DIR, f"USGS_{site}_{ELEV_PARAMETER_CD}_daily.csv")
+
+
+def _read_cache(site: str) -> pd.Series | None:
+    path = _cache_path(site)
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path, parse_dates=["date"])
+    return pd.Series(_numeric(df["elevation_ft"]).to_numpy(), index=pd.DatetimeIndex(df["date"]),
+                     name="elevation_ft")
+
+
+def _write_cache(site: str, series: pd.Series) -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    series.rename("elevation_ft").rename_axis("date").to_frame().to_csv(_cache_path(site))
+
+
+def download_elevation(site: str, start: str, end: str) -> pd.Series:
+    """Daily mean forebay elevation for one USGS site, as a float Series.
+
+    Uses the modernized USGS Water Data API (dataretrieval.waterdata), which
+    replaces the legacy WaterServices endpoints that USGS is retiring. Site
+    numbers are passed in the "USGS-#######" monitoring_location_id form.
+    """
+    from dataretrieval import waterdata  # imported lazily so --offline needs no network stack
+
+    time_range = (f"{pd.to_datetime(start).strftime('%Y-%m-%dT00:00:00Z')}/"
+                  f"{pd.to_datetime(end).strftime('%Y-%m-%dT23:59:59Z')}")
+    data, _ = waterdata.get_daily(
+        monitoring_location_id=f"USGS-{site}",
+        parameter_code=ELEV_PARAMETER_CD,
+        statistic_id=DAILY_MEAN_STAT_CD,
+        time=time_range,
+        skip_geometry=True,
+    )
+    if data is None or data.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="date"))
+
+    value_col = "value" if "value" in data.columns else data.columns[-1]
+    time_col = "time" if "time" in data.columns else data.columns[0]
+    series = pd.Series(
+        _numeric(data[value_col]).to_numpy(),
+        index=pd.DatetimeIndex(pd.to_datetime(data[time_col]).dt.tz_localize(None)),
+    ).sort_index()
+    # USGS missing-value standins used by the DP download script.
+    series[series < -9000] = np.nan
+    series[series.isin([-901, -902])] = np.nan
+    return series.dropna()
+
+
+def get_elevations(sites: pd.DataFrame, start: str, end: str, refresh: bool = False):
+    """Elevation series per project, reading the cache unless --refresh."""
+    elevations = {}
+    for row in sites.itertuples():
+        cached = None if refresh else _read_cache(row.site)
+        if cached is not None and not cached.empty:
+            print(f"[INFO] {row.code} ({row.name}): {len(cached)} cached daily values")
+            elevations[row.code] = cached
+            continue
+        try:
+            series = download_elevation(row.site, start, end)
+        except Exception as exc:
+            print(f"[ERROR] {row.code} ({row.name}) site {row.site} download failed: {exc}")
+            continue
+        if series.empty:
+            print(f"[WARNING] {row.code} ({row.name}) returned no data.")
+            continue
+        _write_cache(row.site, series)
+        print(f"[INFO] {row.code} ({row.name}): downloaded {len(series)} daily values "
+              f"({series.index.min().date()} to {series.index.max().date()})")
+        elevations[row.code] = series
+    return elevations
+
+
+# --------------------------------------------------------------------------
+# Adjustment
+# --------------------------------------------------------------------------
+
+def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
+                year: int) -> pd.DataFrame:
+    """Deplete one year of observed elevation by the cumulative withdrawal.
+
+    The observed elevation is converted to storage on the reservoir's rating
+    curve, the withdrawal demand is accumulated in acre-feet from 01Jan, and
+    the difference is converted back to an elevation. 01Jan itself carries no
+    deficit - the first day's withdrawal is felt on 02Jan - so the two traces
+    start together and diverge over the year.
+    """
+    start = pd.Timestamp(year=year, month=1, day=1)
+    end = pd.Timestamp(year=year, month=12, day=31)
+
+    observed = elevation.loc[(elevation.index >= start) & (elevation.index <= end)]
+    if observed.empty:
+        return pd.DataFrame()
+    # A continuous daily axis from 01Jan through the last observed day, so
+    # gaps in the record stay visible instead of being closed up.
+    axis = pd.date_range(start, observed.index.max(), freq="D")
+    observed = observed.reindex(axis)
+
+    demand = demand_cfs.reindex(axis).fillna(0.0).clip(lower=0.0)
+    daily_af = demand * CFS_DAY_TO_ACRE_FT
+    cumulative_af = daily_af.cumsum().shift(1).fillna(0.0)
+
+    storage_obs = pd.Series(curve.to_storage(observed.to_numpy()), index=axis)
+    storage_obs[observed.isna()] = np.nan
+    storage_adj = (storage_obs - cumulative_af).clip(lower=curve.min_storage)
+    elevation_adj = pd.Series(curve.to_elevation(storage_adj.to_numpy()), index=axis)
+    elevation_adj[storage_adj.isna()] = np.nan
+
+    # Days where the demand exceeded the storage available above the bottom of
+    # the rating curve. The adjusted trace is pinned to the curve minimum there,
+    # so it understates the shortfall and should not be read as a real elevation.
+    unclipped = storage_obs - cumulative_af
+    at_floor = unclipped < curve.min_storage
+
+    return pd.DataFrame({
+        "elev_observed_ft": observed,
+        "elev_adjusted_ft": elevation_adj,
+        "storage_observed_af": storage_obs,
+        "storage_adjusted_af": storage_adj,
+        "demand_cfs": demand,
+        "cumulative_withdrawal_af": cumulative_af,
+        "elev_change_ft": elevation_adj - observed,
+        "at_rating_floor": at_floor.fillna(False),
+    })
+
+
+# --------------------------------------------------------------------------
+# Plotting
+# --------------------------------------------------------------------------
+
+def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: str) -> None:
+    """One PNG: observed and adjusted elevation for one reservoir-year."""
+    fig, ax = plt.subplots(figsize=(11, 5.5), dpi=150)
+    fig.patch.set_facecolor(COLOR_SURFACE)
+    ax.set_facecolor(COLOR_SURFACE)
+
+    ax.plot(frame.index, frame["elev_observed_ft"], color=COLOR_OBSERVED,
+            linewidth=2.0, label="Observed", zorder=3)
+    ax.plot(frame.index, frame["elev_adjusted_ft"], color=COLOR_ADJUSTED,
+            linewidth=2.0, label="Adjusted for withdrawal", zorder=4)
+    ax.fill_between(frame.index, frame["elev_adjusted_ft"], frame["elev_observed_ft"],
+                    color=COLOR_ADJUSTED, alpha=0.12, linewidth=0, zorder=2)
+
+    # Direct labels at the last day both traces share, so identity is never
+    # carried by color alone.
+    both = frame[["elev_observed_ft", "elev_adjusted_ft"]].dropna()
+    if not both.empty:
+        x = both.index[-1]
+        pad = pd.Timedelta(days=4)
+        y_obs = float(both["elev_observed_ft"].iloc[-1])
+        y_adj = float(both["elev_adjusted_ft"].iloc[-1])
+        # Early in a year the traces have barely separated, so the two labels
+        # would overprint. Push them apart by a fraction of the plotted range.
+        span = float(np.nanmax(both.to_numpy()) - np.nanmin(both.to_numpy())) or 1.0
+        if abs(y_obs - y_adj) < 0.06 * span:
+            offset = 0.03 * span
+            y_obs, y_adj = y_obs + offset, y_adj - offset
+        for y, color, label in ((y_obs, COLOR_OBSERVED, "Observed"),
+                                (y_adj, COLOR_ADJUSTED, "Adjusted")):
+            ax.annotate(label, xy=(x + pad, y), color=color, fontsize=9,
+                        fontweight="bold", va="center", ha="left",
+                        annotation_clip=False)
+
+    drop = frame["elev_change_ft"].dropna()
+    if not drop.empty:
+        worst = drop.min()
+        total_af = frame["cumulative_withdrawal_af"].dropna()
+        total = total_af.iloc[-1] if not total_af.empty else 0.0
+        subtitle = (f"Maximum drawdown {abs(worst):,.2f} ft   ·   "
+                    f"cumulative withdrawal {total:,.0f} acre-ft")
+        floor_days = int(frame["at_rating_floor"].sum())
+        if floor_days:
+            subtitle += (f"   ·   demand exceeds available storage on "
+                         f"{floor_days} day{'s' if floor_days != 1 else ''}")
+    else:
+        subtitle = "No overlapping elevation and demand record"
+
+    ax.set_title(f"{name} ({code}) — {year} forebay elevation",
+                 fontsize=14, fontweight="bold", color=COLOR_TEXT, loc="left", pad=18)
+    ax.text(0.0, 1.015, subtitle, transform=ax.transAxes, fontsize=9.5,
+            color=COLOR_TEXT_MUTED, ha="left", va="bottom")
+    ax.set_ylabel("Elevation (ft, NGVD29)", fontsize=10, color=COLOR_TEXT_MUTED)
+
+    ax.grid(True, axis="y", color=COLOR_GRID, linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(COLOR_GRID)
+    ax.tick_params(colors=COLOR_TEXT_MUTED, labelsize=9)
+
+    ax.set_xlim(frame.index[0], frame.index[-1] + pd.Timedelta(days=26))
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+
+    # Below the axes: a rule-curve pool fills the plot area at some point in
+    # every year, so any in-axes corner eventually collides with the data.
+    legend = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10),
+                       frameon=False, fontsize=9.5, ncol=2)
+    for text in legend.get_texts():
+        text.set_color(COLOR_TEXT_MUTED)
+
+    fig.tight_layout()
+    fig.savefig(out_path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--refresh", action="store_true",
+                        help="re-download from USGS instead of using data/cache/")
+    parser.add_argument("--years", type=int, nargs="+",
+                        help=f"years to process (default {FIRST_YEAR}-{LAST_YEAR})")
+    parser.add_argument("--out", default=OUT_DIR, help="output directory (default ../out)")
+    parser.add_argument("--data-dir", default=None,
+                        help="read inputs from here instead of ../data (for testing "
+                             "against generated inputs, see make_dummy_inputs.py)")
+    args = parser.parse_args(argv)
+
+    if args.data_dir:
+        global DATA_DIR, CACHE_DIR, ELEV_DICT_PATH, STOR_RATINGS_PATH, DEMAND_PATH
+        DATA_DIR = os.path.abspath(args.data_dir)
+        CACHE_DIR = os.path.join(DATA_DIR, "cache")
+        ELEV_DICT_PATH = os.path.join(DATA_DIR, "WIL_ELEV_DICT.csv")
+        STOR_RATINGS_PATH = os.path.join(DATA_DIR, "STOR_RATINGS.xlsx")
+        DEMAND_PATH = os.path.join(DATA_DIR, "ALT_WithdrawalDemand.csv")
+        print(f"[INFO] Reading inputs from {DATA_DIR}")
+
+    years = args.years or list(range(FIRST_YEAR, LAST_YEAR + 1))
+
+    for path in (ELEV_DICT_PATH, STOR_RATINGS_PATH, DEMAND_PATH):
+        if not os.path.exists(path):
+            print(f"[ERROR] Missing required input: {path}")
+            return 1
+
+    sites = read_elev_dict(ELEV_DICT_PATH)
+    projects = dict(zip(sites["code"], sites["name"]))
+    print(f"[INFO] {len(projects)} projects: {', '.join(sorted(projects))}\n")
+
+    curves = read_stor_ratings(projects, STOR_RATINGS_PATH)
+    print()
+    demand = read_demand(projects, DEMAND_PATH)
+    print()
+
+    start = f"{min(years)}-01-01"
+    end = min(pd.Timestamp.today().normalize(), pd.Timestamp(f"{max(years)}-12-31"))
+    elevations = get_elevations(sites, start, end.strftime("%Y-%m-%d"), refresh=args.refresh)
+    print()
+
+    written = 0
+    for year in years:
+        year_dir = os.path.join(args.out, str(year))
+        os.makedirs(year_dir, exist_ok=True)
+        for code, name in sorted(projects.items(), key=lambda p: p[1]):
+            if code not in elevations:
+                continue
+            if code not in curves:
+                print(f"[WARNING] {year} {code}: no rating curve; skipped.")
+                continue
+
+            resolved = demand_for_project(demand, code)
+            if resolved is None:
+                print(f"[WARNING] {year} {code}: no demand column; skipped.")
+                continue
+            demand_cfs, source = resolved
+            if source != code:
+                print(f"[INFO] {year} {code}: demand column is {source}")
+
+            frame = adjust_year(elevations[code], demand_for_year(demand_cfs, year),
+                                curves[code], year)
+            if frame.empty:
+                print(f"[WARNING] {year} {code}: no elevation record; skipped.")
+                continue
+
+            png = os.path.join(year_dir, f"{code}_{year}_elevation.png")
+            plot_year(frame, code, name, year, png)
+            frame.round(3).rename_axis("date").to_csv(
+                os.path.join(year_dir, f"{code}_{year}_elevation.csv"))
+            written += 1
+            worst = frame["elev_change_ft"].min()
+            print(f"[INFO] {year} {code}: {os.path.relpath(png, args.out)} "
+                  f"(max drawdown {abs(worst):,.2f} ft)")
+
+    print(f"\n[INFO] Wrote {written} reservoir-year plots under {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
