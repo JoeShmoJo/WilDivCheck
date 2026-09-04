@@ -99,10 +99,11 @@ numbers can be checked.
 ## Rule curve
 
 Each plot also carries the project's rule curve in black, read from
-`data/RuleCurves.csv`. The file covers 1900-2020 and the curve repeats
-annually -- the years differ by under a foot, from leap-day alignment -- so it
-is applied as a day-of-year pattern taken from the most recent year present.
-Green Peter has no column in that file and is plotted without a rule curve.
+`data/RuleCurves.csv`, which holds one representative year. It is applied as a
+day-of-year pattern, so it maps onto any plotted year. The source year is not a
+leap year and has no 29 February; in a leap year that day is interpolated from
+28 February and 1 March rather than left as a gap. A project with no column in
+the file is plotted without a rule curve.
 
 ## Method
 

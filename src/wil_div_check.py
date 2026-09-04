@@ -393,12 +393,10 @@ def demand_for_project(demand: pd.DataFrame, code: str) -> tuple[pd.Series, str]
 def read_rule_curves(projects: dict, path: str) -> dict:
     """Rule curve elevation per project, as a (month, day) -> elevation map.
 
-    RuleCurves.csv is one column per project over many years, and the curve
-    repeats annually (the years differ by under a foot, from leap-day
-    alignment), so it is stored as a day-of-year pattern and mapped onto
-    whichever year is being plotted. The most recent year present is used as
-    the pattern. Green Peter has no column in the file and simply gets no rule
-    curve line.
+    RuleCurves.csv is one column per project over a single representative year,
+    so it is stored as a day-of-year pattern and mapped onto whichever year is
+    being plotted. A file carrying several years is reduced to the most recent
+    complete one. Any project without a column simply gets no rule curve line.
     """
     if not os.path.exists(path):
         print(f"[WARNING] No rule curves at {path}; plots omit the rule curve.")
@@ -406,9 +404,10 @@ def read_rule_curves(projects: dict, path: str) -> dict:
 
     raw = pd.read_csv(path)
     date_col = raw.columns[0]
-    # The first row's date is a spreadsheet overflow ("#####"), so bad dates
-    # are dropped rather than trusted.
     dates = pd.to_datetime(raw[date_col], format="%d%b%Y", errors="coerce")
+    if dates.isna().any():
+        print(f"[WARNING] {int(dates.isna().sum())} unreadable date(s) in "
+              f"{os.path.basename(path)}; those rows are ignored.")
     raw = raw[dates.notna()].set_index(pd.DatetimeIndex(dates.dropna()))
 
     curves = {}
@@ -421,12 +420,15 @@ def read_rule_curves(projects: dict, path: str) -> dict:
         series = _numeric(raw[column]).dropna()
         if series.empty:
             continue
+        # Several years collapse to the most recent complete one; a single
+        # year is used as it stands.
         latest = series[series.index.year == series.index.year.max()]
         pattern = latest if len(latest) >= 300 else series
         pattern = pattern.groupby([pattern.index.month, pattern.index.day]).mean()
         curves[code] = pattern
+        leap = "" if (2, 29) in pattern.index else ", no 29 Feb (filled per year)"
         print(f"[INFO] Rule curve {code}: {pattern.min():,.2f}-{pattern.max():,.2f} ft "
-              f"from {latest.index.year.max() if len(latest) >= 300 else 'all years'}")
+              f"over {len(pattern)} days{leap}")
 
     missing = sorted(set(projects) - set(curves))
     if missing:
@@ -435,11 +437,19 @@ def read_rule_curves(projects: dict, path: str) -> dict:
 
 
 def rule_curve_for_year(pattern: pd.Series, year: int) -> pd.Series:
-    """Map a (month, day) rule curve pattern onto one calendar year."""
+    """Map a (month, day) rule curve pattern onto one calendar year.
+
+    The source year need not be a leap year, so 29 February can be absent from
+    the pattern while the plotted year has one. That day is interpolated from
+    28 February and 1 March rather than left as a gap in the line.
+    """
     axis = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
     aligned = pattern.reindex(pd.MultiIndex.from_arrays([axis.month, axis.day]))
     aligned.index = axis
-    return aligned.ffill()
+    if aligned.isna().any():
+        aligned = aligned.interpolate(method="time", limit_area="inside")
+        aligned = aligned.ffill().bfill()
+    return aligned
 
 
 def demand_for_year(series: pd.Series, year: int) -> pd.Series:
