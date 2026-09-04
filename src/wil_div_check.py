@@ -714,40 +714,6 @@ def get_elevations(sites: pd.DataFrame, start: str, end: str, refresh: bool = Fa
 # Adjustment
 # --------------------------------------------------------------------------
 
-def _carried_deficit(daily_af: pd.Series, storage_obs: pd.Series) -> pd.Series:
-    """The withdrawal deficit carried into each day, in acre-feet.
-
-    Withdrawal accumulates while the demand is on. Once it stops, the deficit is
-    repaid out of the reservoir's own drawdown: every acre-foot released after
-    the season is an acre-foot that would instead have covered the withdrawal,
-    so the operator reaches the same target pool having released that much less.
-
-    Carrying the full season's withdrawal to 31 December instead would subtract
-    it from a pool that has already drawn down to its winter minimum, and the
-    adjusted trace would fall off the bottom of the rating curve months after
-    the last withdrawal.
-
-    Days with no observed elevation neither accrue nor repay -- the release over
-    a gap in the record is unknown, so the deficit is simply held.
-    """
-    take = daily_af.to_numpy(dtype=float)
-    storage = storage_obs.to_numpy(dtype=float)
-    carried = np.zeros(len(take))
-
-    deficit = 0.0
-    for i in range(len(take)):
-        # Today's withdrawal is felt tomorrow, so 01Jan carries no deficit.
-        carried[i] = deficit
-        deficit += take[i]
-        if take[i] > 0.0 or deficit <= 0.0 or i + 1 >= len(take):
-            continue
-        release = storage[i] - storage[i + 1]
-        if np.isfinite(release) and release > 0.0:
-            deficit = max(0.0, deficit - release)
-
-    return pd.Series(carried, index=daily_af.index)
-
-
 def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
                 year: int) -> pd.DataFrame:
     """Deplete one year of observed elevation by the cumulative withdrawal.
@@ -756,8 +722,10 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
     curve, the withdrawal demand is accumulated in acre-feet from 01Jan, and
     the difference is converted back to an elevation. 01Jan itself carries no
     deficit - the first day's withdrawal is felt on 02Jan - so the two traces
-    start together and diverge over the year, then converge again as the
-    reservoir draws down after the demand season (see `_carried_deficit`).
+    start together and diverge over the year. The withdrawal is not made up
+    afterwards, so the storage difference holds at the season total for the rest
+    of the year; the elevation difference keeps widening over it, because the
+    same volume is worth more feet as the pool empties down the rating curve.
     """
     start = pd.Timestamp(year=year, month=1, day=1)
     end = pd.Timestamp(year=year, month=12, day=31)
@@ -772,19 +740,18 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
 
     demand = demand_cfs.reindex(axis).fillna(0.0).clip(lower=0.0)
     daily_af = demand * CFS_DAY_TO_ACRE_FT
-    withdrawn_af = daily_af.cumsum().shift(1).fillna(0.0)
+    cumulative_af = daily_af.cumsum().shift(1).fillna(0.0)
 
     storage_obs = pd.Series(curve.to_storage(observed.to_numpy()), index=axis)
     storage_obs[observed.isna()] = np.nan
-    deficit_af = _carried_deficit(daily_af, storage_obs)
-    storage_adj = (storage_obs - deficit_af).clip(lower=curve.min_storage)
+    storage_adj = (storage_obs - cumulative_af).clip(lower=curve.min_storage)
     elevation_adj = pd.Series(curve.to_elevation(storage_adj.to_numpy()), index=axis)
     elevation_adj[storage_adj.isna()] = np.nan
 
     # Days where the demand exceeded the storage available above the bottom of
     # the rating curve. The adjusted trace is pinned to the curve minimum there,
     # so it understates the shortfall and should not be read as a real elevation.
-    unclipped = storage_obs - deficit_af
+    unclipped = storage_obs - cumulative_af
     at_floor = unclipped < curve.min_storage
 
     return pd.DataFrame({
@@ -793,8 +760,7 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
         "storage_observed_af": storage_obs,
         "storage_adjusted_af": storage_adj,
         "demand_cfs": demand,
-        "cumulative_withdrawal_af": withdrawn_af,
-        "deficit_af": deficit_af,
+        "cumulative_withdrawal_af": cumulative_af,
         "elev_change_ft": elevation_adj - observed,
         "at_rating_floor": at_floor.fillna(False),
     })
