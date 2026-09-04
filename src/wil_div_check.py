@@ -726,6 +726,9 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
     afterwards, so the storage difference holds at the season total for the rest
     of the year; the elevation difference keeps widening over it, because the
     same volume is worth more feet as the pool empties down the rating curve.
+
+    The adjusted trace ends on the first day the withdrawal exceeds the storage
+    the reservoir actually held.
     """
     start = pd.Timestamp(year=year, month=1, day=1)
     end = pd.Timestamp(year=year, month=12, day=31)
@@ -744,15 +747,20 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
 
     storage_obs = pd.Series(curve.to_storage(observed.to_numpy()), index=axis)
     storage_obs[observed.isna()] = np.nan
-    storage_adj = (storage_obs - cumulative_af).clip(lower=curve.min_storage)
+    storage_adj = storage_obs - cumulative_af
+
+    # The first day the withdrawal takes more water than the reservoir holds.
+    # Past it there is no answer to plot: the scenario is infeasible, the pool
+    # would have been drawn to nothing, and how it recovered afterwards depends
+    # on curtailment this model knows nothing about. Clamping to the bottom of
+    # the rating table instead would draw a flat line at the curve minimum and
+    # read as a real pool elevation, which it is not. So the trace stops.
+    short = storage_adj < curve.min_storage
+    exhausted = short.fillna(False).cummax()
+    storage_adj[exhausted] = np.nan
+
     elevation_adj = pd.Series(curve.to_elevation(storage_adj.to_numpy()), index=axis)
     elevation_adj[storage_adj.isna()] = np.nan
-
-    # Days where the demand exceeded the storage available above the bottom of
-    # the rating curve. The adjusted trace is pinned to the curve minimum there,
-    # so it understates the shortfall and should not be read as a real elevation.
-    unclipped = storage_obs - cumulative_af
-    at_floor = unclipped < curve.min_storage
 
     return pd.DataFrame({
         "elev_observed_ft": observed,
@@ -762,7 +770,7 @@ def adjust_year(elevation: pd.Series, demand_cfs: pd.Series, curve: RatingCurve,
         "demand_cfs": demand,
         "cumulative_withdrawal_af": cumulative_af,
         "elev_change_ft": elevation_adj - observed,
-        "at_rating_floor": at_floor.fillna(False),
+        "storage_exhausted": exhausted,
     })
 
 
@@ -784,6 +792,19 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
     ax.plot(frame.index, frame["elev_adjusted_ft"], color=COLOR_ADJUSTED,
             linewidth=2.0, label="Adjusted for withdrawal", zorder=4)
 
+    # A stop mid-year is deliberate, not a gap in the record, so say so on the
+    # plot rather than leaving the line to trail off.
+    if frame["storage_exhausted"].any():
+        last = frame["elev_adjusted_ft"].last_valid_index()
+        if last is not None:
+            ax.plot([last], [frame.loc[last, "elev_adjusted_ft"]], marker="o",
+                    markersize=6, color=COLOR_ADJUSTED, markeredgecolor=COLOR_SURFACE,
+                    markeredgewidth=2, zorder=5)
+            ax.annotate("reservoir empty", xy=(last, frame.loc[last, "elev_adjusted_ft"]),
+                        xytext=(8, 3), textcoords="offset points", fontsize=9,
+                        color=COLOR_ADJUSTED, fontweight="bold", va="bottom",
+                        ha="left", annotation_clip=False)
+
     drop = frame["elev_change_ft"].dropna()
     if not drop.empty:
         worst = drop.min()
@@ -791,10 +812,10 @@ def plot_year(frame: pd.DataFrame, code: str, name: str, year: int, out_path: st
         total = total_af.iloc[-1] if not total_af.empty else 0.0
         subtitle = (f"Maximum drawdown {abs(worst):,.2f} ft   ·   "
                     f"cumulative withdrawal {total:,.0f} acre-ft")
-        floor_days = int(frame["at_rating_floor"].sum())
-        if floor_days:
-            subtitle += (f"   ·   demand exceeds available storage on "
-                         f"{floor_days} day{'s' if floor_days != 1 else ''}")
+        exhausted = frame["storage_exhausted"]
+        if exhausted.any():
+            ran_dry = exhausted.idxmax()
+            subtitle += f"   ·   runs dry {ran_dry:%d %b}"
     else:
         subtitle = "No overlapping elevation and demand record"
 

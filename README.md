@@ -120,10 +120,13 @@ the file is plotted without a rule curve.
   Cottage Grove 2016 holds a constant 6,444 acre-ft deficit from 30 September,
   and the elevation gap grows from 10 ft to 23 ft over October on curve shape
   alone. This is expected, not an artifact.
-- Where the demand exceeds the storage available above the bottom of the rating
-  curve, the adjusted trace is pinned to the curve minimum and the plot subtitle
-  says on how many days that happened. On those days the adjusted elevation
-  understates the shortfall and should not be read as a real pool level.
+- The adjusted trace **ends** on the first day the withdrawal exceeds the
+  storage the reservoir actually held. Past that point the scenario is
+  infeasible — the pool would have been drawn to nothing, and how it recovered
+  depends on curtailment this model knows nothing about — so there is no
+  elevation to plot. The last point is marked *reservoir empty* and the subtitle
+  gives the date. 69 of the 120 reservoir-years run dry; Fall Creek 2023 does so
+  on 17 August, mid-season.
 
 ## Testing without USGS access
 
